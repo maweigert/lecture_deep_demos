@@ -1,0 +1,12 @@
+{
+  "name": "lecture-deep-demos",
+  "private": true,
+  "type": "module",
+  "description": "Browser demos of the lecture Deep Learning for Vision; the check script needs Playwright",
+  "scripts": {
+    "check": "node scripts/check.mjs"
+  },
+  "devDependencies": {
+    "playwright-chromium": "^1.64.1"
+  }
+}

@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter playground</title>
+<link rel="stylesheet" href="../common/demo.css">
+<!--
+  Single-channel images, one kernel: correlation or convolution, stride, padding, ReLU, pooling, Fourier views and
+  circular input shifts (lecture 3). Photos in imgs/ are 240x240 grayscale PNGs: Blaues Wunder, historical photo
+  by Jörg Blobelt, CC BY-SA 4.0, https://commons.wikimedia.org/wiki/File:19700818020NR_Dresden_Blasewitz_Elbbr%C3%BCcke_Blaues_Wunder.jpg
+  (480x480 window around the tower, x 180-660, y 60-540, downsampled 2x, and a 64x64 version of the full-height left
+  square crop; the adapted crops are shared under CC BY-SA 4.0 as well); scikit-image sample data human_mitosis, CC0
+  (David Root, densest 240x240 window); butterfly wing scale, SEM by Brandon Antonio Segura Torres and Priscilla Vieto
+  Bonilla, CC BY-SA 4.0, https://commons.wikimedia.org/wiki/File:Escama_de_ala_de_mariposa_SEM.jpg (288x288 window at
+  (850, 450) of the 2048x1391 original resized to 240x240; ridges give a row of peaks with harmonics in the spectrum);
+  graphene on SiC, STM by Nathan Guisinger, Argonne National Laboratory, CC BY-SA 2.0,
+  https://commons.wikimedia.org/wiki/File:Graphene-epitaxial.jpg (360x360 window at (0, 480) of the 840x840 original
+  resized to 240x240 and contrast-stretched, 1st to 99th percentile, away from the point defect; hexagonal lattice of
+  peaks). Fourier views use a periodic Hann window by default (hann=0 turns it off; never for the phase change).
+  Synthetic images are generated on a 120x120 grid. State is kept in the URL hash, so a link reproduces a setting,
+  e.g. #kernel=sobel_x&stride=2&tx=3
+-->
+<style>
+  :root { --bad: #d62728; --good: #2ca02c; }
+  main { grid-template-columns: 270px minmax(0, 1fr); }
+  .row label { min-width: 64px; }
+  .row input[type=range] { flex: 1; }
+  .row output { min-width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+  #kernelGrid { display: grid; gap: 2px; margin-top: 6px; }
+  #kernelGrid input { width: 100%; padding: 2px; text-align: center; font-size: 12px; border-color: transparent; color: #1f2933; }
+  #credit { font-size: 60%; }
+  .panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-content: start; }
+  canvas { background: var(--panel); }
+  /* smaller outputs (stride, pooling) sit centred in an input-sized frame */
+</style>
+</head>
+<body>
+<main>
+  <aside>
+    <h1>Filter playground</h1>
+    <fieldset>
+      <legend>Image</legend>
+      <select id="image">
+        <option value="bridge">Blaues Wunder, Dresden</option>
+        <option value="bridge_small">Blaues Wunder, small (64×64)</option>
+        <option value="butterfly">butterfly wing scale (SEM)</option>
+        <option value="graphene">graphene atoms (STM)</option>
+        <option value="pattern">test pattern (shapes, stripes)</option>
+        <option value="nuclei">nuclei (fluorescence)</option>
+        <option value="impulse">impulse</option>
+        <option value="disks">disks</option>
+        <option value="upload">upload image…</option>
+      </select>
+      <input type="file" id="file" accept="image/*" class="hide">
+    </fieldset>
+    <fieldset>
+      <legend>Kernel</legend>
+      <select id="kernel"></select>
+      <div id="kernelGrid"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Operation</legend>
+      <div class="seg" id="op"><button data-v="corr">correlation</button><button data-v="conv">convolution</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Stride</legend>
+      <div class="seg" id="stride"><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Padding</legend>
+      <div class="row"><label>pixels</label><div class="seg" id="padn" style="flex: 1"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="same">same</button></div></div>
+      <div class="row"><label>mode</label><div class="seg" id="pad" style="flex: 1"><button data-v="zero">zeros</button><button data-v="circular">circular</button></div></div>
+    </fieldset>
+    <fieldset>
+      <legend>Activation</legend>
+      <div class="seg" id="act"><button data-v="none">none</button><button data-v="relu">ReLU</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Pooling</legend>
+      <select id="pool">
+        <option value="none">none</option>
+        <option value="maxpool">max 2×2, stride 2</option>
+        <option value="avgpool">average 2×2, stride 2</option>
+        <option value="gmax">global max</option>
+        <option value="gavg">global average</option>
+      </select>
+    </fieldset>
+    <fieldset>
+      <legend>Display</legend>
+      <select id="spec">
+        <option value="none">image only</option>
+        <option value="mag">+ Fourier magnitude log(1 + |F|)</option>
+        <option value="phase">+ Fourier phase arg F (hue) and magnitude</option>
+        <option value="dphase">+ phase change from the shift (hue)</option>
+      </select>
+      <div class="row" id="hannRow"><label style="min-width: 0" title="Fades the image to zero at its borders before the DFT, so the jumps at the periodic boundary do not add a cross through the centre. Not used for the phase change, which needs the exact shift theorem."><input type="checkbox" id="hann"> Hann window before the DFT</label></div>
+    </fieldset>
+    <fieldset>
+      <legend>Input shift (circular)</legend>
+      <div class="row"><label for="tx">right <i>t<sub>x</sub></i></label><input type="range" id="tx" min="-16" max="16" step="1"><output id="txOut"></output></div>
+      <div class="row"><label for="ty">down <i>t<sub>y</sub></i></label><input type="range" id="ty" min="-16" max="16" step="1"><output id="tyOut"></output></div>
+      <div class="row"><label style="min-width: 0"><input type="checkbox" id="snap"> shift in multiples of the total stride</label></div>
+      <div class="seg"><button id="play">▶ play</button><button id="reset">reset</button></div>
+      <p class="hint">Arrow keys shift, space plays, pinch on an image zooms (double-click resets). <a href="#" id="copy">Copy link</a></p>
+    </fieldset>
+  </aside>
+  <section class="panels" id="panels">
+    <figure><figcaption>input <span id="capIn"></span></figcaption><div class="frame"><div class="inner"><canvas id="cIn"></canvas></div></div><p class="hint hide" id="credit"></p></figure>
+    <figure><figcaption>output <span id="capOut"></span></figcaption><div class="frame"><div class="inner"><canvas id="cOut"></canvas></div></div></figure>
+    <figure class="spec"><figcaption>input, <span id="capInF"></span></figcaption><div class="frame"><div class="inner"><canvas id="cInF"></canvas></div></div></figure>
+    <figure class="spec" id="figOutF"><figcaption>output, <span id="capOutF"></span></figcaption><div class="frame"><div class="inner"><canvas id="cOutF"></canvas></div></div></figure>
+  </section>
+</main>
+<script type="module">
+import { $, hashState, segButtons, copyLink, zoomController } from "../common/demo.js";
+const SIZE_SYNTH = 120, SIZE_PHOTO = 240;  // both divisible by every total stride (1, 2, 3, 4, 6, 8)
+const SIZES = { bridge_small: 64 };  // photos with another size
+let S = SIZE_SYNTH;  // current image size; photos use 240 x 240, synthetic images keep their 120 x 120 pixel design
+const IMAGES = { bridge_small: "imgs/bridge_small.png", bridge: "imgs/bridge.png", nuclei: "imgs/nuclei.png", butterfly: "imgs/butterfly.png", graphene: "imgs/graphene.png" };
+
+const CC = v => `<a href="https://creativecommons.org/licenses/by-sa/${v}/" target="_blank" rel="noopener">CC BY-SA ${v}</a>`;
+const commons = (file, text) => `<a href="https://commons.wikimedia.org/wiki/File:${file}" target="_blank" rel="noopener">${text}</a>`;
+const CREDITS = {  // shown under the input panel; adapted crops are shared under the licence of their source
+  bridge: `${commons("19700818020NR_Dresden_Blasewitz_Elbbr%C3%BCcke_Blaues_Wunder.jpg", "J. Blobelt")}, ${CC("4.0")}`,
+  butterfly: `${commons("Escama_de_ala_de_mariposa_SEM.jpg", "B. A. Segura Torres, P. Vieto Bonilla")}, ${CC("4.0")}`,
+  graphene: `${commons("Graphene-epitaxial.jpg", "N. Guisinger, ANL")}, ${CC("2.0")}`,
+};
+CREDITS.bridge_small = CREDITS.bridge;
+
+// ---------- kernels ----------
+function gaussian(sigma, k) {
+  const r = (k - 1) / 2, w = [];
+  for (let a = -r; a <= r; a++) for (let b = -r; b <= r; b++) w.push(Math.exp(-(a * a + b * b) / (2 * sigma * sigma)));
+  const s = w.reduce((p, q) => p + q, 0);
+  return w.map(v => v / s);
+}
+const box = k => Array(k * k).fill(1 / (k * k));
+const KERNELS = {
+  identity: { label: "identity", k: 3, w: [0, 0, 0, 0, 1, 0, 0, 0, 0] },
+  shift: { label: "shift by 1 pixel", k: 3, w: [0, 0, 0, 1, 0, 0, 0, 0, 0] },
+  box3: { label: "box filter 3×3", k: 3, w: box(3) },
+  box7: { label: "box filter 7×7", k: 7, w: box(7) },
+  gauss: { label: "Gaussian 7×7, σ = 1.5", k: 7, w: gaussian(1.5, 7) },
+  sobel_x: { label: "Sobel x", k: 3, w: [-1, 0, 1, -2, 0, 2, -1, 0, 1] },
+  sobel_y: { label: "Sobel y", k: 3, w: [-1, -2, -1, 0, 0, 0, 1, 2, 1] },
+  laplace: { label: "Laplacian 3×3", k: 3, w: [0, 1, 0, 1, -4, 1, 0, 1, 0] },
+  sharpen: { label: "sharpening 3×3", k: 3, w: [0, -1, 0, -1, 5, -1, 0, -1, 0] },
+  asym: { label: "asymmetric 3×3", k: 3, w: [-4, -3, -2, -1, 0, 1, 2, 3, 4] },
+  custom: { label: "custom 3×3", k: 3, w: [0, 0, 0, 0, 1, 0, 0, 0, 0] },
+};
+
+// ---------- state and URL ----------
+const DEFAULTS = { image: "bridge", kernel: "sobel_x", op: "corr", stride: 1, pad: "zero", padn: "same", act: "none", pool: "none", spec: "none", hann: 1, snap: 0, tx: 0, ty: 0, custom: KERNELS.custom.w.join(",") };
+const { state, read: readHash, write } = hashState(DEFAULTS, state => {
+  const c = state.custom.split(",").map(Number);
+  if (c.length === 9 && c.every(Number.isFinite)) KERNELS.custom.w = c;
+  if (!KERNELS[state.kernel]) state.kernel = DEFAULTS.kernel;
+  if (![...$("image").options].some(o => o.value === state.image)) state.image = DEFAULTS.image;  // e.g. links to removed images
+  if (!["none", "mag", "phase", "dphase"].includes(state.spec)) state.spec = state.spec === "1" ? "mag" : "none";
+});
+function writeHash() { state.custom = KERNELS.custom.w.join(","); write(); }
+// ---------- images ----------
+let base = new Float32Array(S * S);
+let uploaded = null;
+function pattern(i, j) {  // shapes, coarse to fine stripes, a thin line and a single dot on a 120 x 120 grid
+  const inRect = (r0, c0, r1, c1) => i >= r0 && i < r1 && j >= c0 && j < c1;
+  if ((i - 20) ** 2 + (j - 20) ** 2 <= 12 ** 2) return 1;  // disk
+  if (inRect(10, 38, 26, 54)) return 0.8;  // square
+  if (i >= 34 && i < 56 && j >= 6 && j - 6 <= (i - 34)) return 1;  // triangle
+  const ring = (i - 86) ** 2 + (j - 24) ** 2;
+  if (ring <= 14 ** 2 && ring >= 10 ** 2) return 1;  // ring
+  if (Math.abs((i - 64) - 2 * (j - 42)) <= 1 && i >= 64 && i < 112) return 1;  // thin steep line
+  if (i === 104 && j === 6) return 1;  // single dot
+  if (inRect(6, 64, 30, 114)) return (Math.floor(j / 2) % 2) ? 1 : 0;  // vertical stripes, period 4
+  if (inRect(34, 64, 58, 114)) return 0.5 + 0.5 * Math.cos(2 * Math.PI * (j - 64) / 3);  // finer stripes, period 3
+  if (inRect(64, 64, 90, 114)) return 0.5 + 0.5 * Math.cos(2 * Math.PI * (i + j) / 6);  // diagonal stripes
+  if (inRect(96, 64, 114, 114)) return ((Math.floor(i / 3) + Math.floor(j / 3)) % 2);  // checkerboard, 3 px squares
+  return 0;
+}
+function synth(name) {
+  const x = new Float32Array(S * S);
+  for (let i = 0; i < S; i++) for (let j = 0; j < S; j++) {
+    let v = 0;
+    if (name === "pattern") v = pattern(i, j);
+    else if (name === "impulse") v = (i === S / 2 && j === S / 2) ? 1 : 0;
+    else if (name === "disks") {
+      for (const [ci, cj, r] of [[30, 34, 14], [80, 30, 9], [64, 88, 20], [104, 100, 7], [26, 100, 5]])
+        if ((i - ci) ** 2 + (j - cj) ** 2 <= r * r) v = 1;
+    }
+    x[i * S + j] = v;
+  }
+  return x;
+}
+function fromImage(img) {
+  const c = document.createElement("canvas"); c.width = S; c.height = S;
+  const g = c.getContext("2d");
+  const s = Math.min(img.width, img.height);
+  g.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, S, S);
+  const d = g.getImageData(0, 0, S, S).data, x = new Float32Array(S * S);
+  for (let n = 0; n < S * S; n++) x[n] = (0.299 * d[4 * n] + 0.587 * d[4 * n + 1] + 0.114 * d[4 * n + 2]) / 255;
+  return x;
+}
+function loadImage() {
+  return new Promise(resolve => {
+    const name = state.image;
+    const src = name === "upload" ? uploaded : IMAGES[name];
+    S = src ? (SIZES[name] ?? SIZE_PHOTO) : SIZE_SYNTH;
+    if (!src) { base = synth(name === "upload" ? "disks" : name); resolve(); return; }
+    const img = new Image();
+    img.onload = () => { base = fromImage(img); resolve(); };
+    img.src = src;
+  });
+}
+
+// ---------- operations ----------
+function shiftImg(x, tx, ty) {  // content moves right by tx and down by ty (circular)
+  const y = new Float32Array(S * S);
+  for (let i = 0; i < S; i++) for (let j = 0; j < S; j++)
+    y[i * S + j] = x[(((i - ty) % S) + S) % S * S + (((j - tx) % S) + S) % S];
+  return y;
+}
+function padAmount(k) { return state.padn === "same" ? (k - 1) / 2 : Number(state.padn); }
+function conv(x, kern, s, pad, flip) {  // padding p on each side, output size floor((S + 2p - k) / s) + 1
+  const k = kern.k, p = padAmount(k), w = kern.w, n = Math.floor((S + 2 * p - k) / s) + 1;
+  const y = new Float32Array(n * n);
+  for (let oi = 0; oi < n; oi++) for (let oj = 0; oj < n; oj++) {
+    let acc = 0;
+    for (let a = 0; a < k; a++) for (let b = 0; b < k; b++) {
+      let ii = oi * s + a - p, jj = oj * s + b - p;
+      if (pad === "circular") { ii = ((ii % S) + S) % S; jj = ((jj % S) + S) % S; }
+      else if (ii < 0 || jj < 0 || ii >= S || jj >= S) continue;
+      acc += x[ii * S + jj] * (flip ? w[(k - 1 - a) * k + (k - 1 - b)] : w[a * k + b]);
+    }
+    y[oi * n + oj] = acc;
+  }
+  return { data: y, n };
+}
+function post(o, mode) {
+  const { data, n } = o;
+  if (mode === "relu") return { data: data.map(v => Math.max(0, v)), n };
+  if (mode === "maxpool" || mode === "avgpool") {
+    const m = Math.floor(n / 2), y = new Float32Array(m * m);
+    for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) {
+      const v = [data[2 * i * n + 2 * j], data[2 * i * n + 2 * j + 1], data[(2 * i + 1) * n + 2 * j], data[(2 * i + 1) * n + 2 * j + 1]];
+      y[i * m + j] = mode === "maxpool" ? Math.max(...v) : (v[0] + v[1] + v[2] + v[3]) / 4;
+    }
+    return { data: y, n: m };
+  }
+  if (mode === "gmax") return { scalar: data.reduce((p, q) => Math.max(p, q), -Infinity) };
+  if (mode === "gavg") return { scalar: data.reduce((p, q) => p + q, 0) / data.length };
+  return o;
+}
+function padded(x, p, fill) {  // (S, S) -> (S + 2p, S + 2p) with the padding values the convolution sees
+  const m = S + 2 * p, y = new Float32Array(m * m);
+  for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) {
+    let ii = i - p, jj = j - p;
+    if (fill === "circular") { ii = ((ii % S) + S) % S; jj = ((jj % S) + S) % S; }
+    else if (ii < 0 || jj < 0 || ii >= S || jj >= S) continue;
+    y[i * m + j] = x[ii * S + jj];
+  }
+  return y;
+}
+function forward(x) {
+  const flip = state.op === "conv";
+  const z = conv(x, KERNELS[state.kernel], state.stride, state.pad, flip);
+  return post(state.act === "relu" ? post(z, "relu") : z, state.pool);
+}
+
+// ---------- drawing ----------
+function color(v, lo, hi) {  // grayscale, linear from lo (black) to hi (white)
+  const g = Math.round(255 * Math.min(1, Math.max(0, (v - lo) / Math.max(1e-12, hi - lo))));
+  return [g, g, g];
+}
+function kernelColor(v, vmax) {  // pastel coolwarm: blue for negative, white for zero, red for positive weights
+  const t = vmax > 0 ? Math.max(-1, Math.min(1, v / vmax)) : 0;
+  const end = t < 0 ? [120, 160, 230] : [235, 130, 120], u = 0.75 * Math.abs(t);
+  const c = [255, 255, 255].map((w, q) => Math.round(w + (end[q] - w) * u));
+  return `rgb(${c.join(",")})`;
+}
+function pixelScale() {  // CSS pixels per image pixel, shared by input and output so their sizes are comparable
+  const dpr = window.devicePixelRatio || 1;  // steps of whole device pixels keep every image pixel equally wide
+  const avail = Math.min(document.getElementById("cIn").closest("figure").clientWidth, (window.innerHeight - 110) / (state.spec !== "none" ? 2 : 1) - (state.spec !== "none" ? 30 : 0));
+  return Math.max(1, Math.floor(avail * dpr / (S + 6))) / dpr;  // room for up to 3 padding pixels per side
+}
+function paint(canvas, data, n, lo, hi, frame = S) {
+  canvas.width = n; canvas.height = n;
+  const g = canvas.getContext("2d"), im = g.createImageData(n, n);
+  for (let p = 0; p < n * n; p++) { const [r, gg, b] = color(data[p], lo, hi); im.data.set([r, gg, b, 255], 4 * p); }
+  g.putImageData(im, 0, 0);
+  canvas.style.width = canvas.style.height = `${n * pixelScale()}px`;
+  canvas.closest(".frame").style.width = canvas.closest(".frame").style.height = `${frame * pixelScale()}px`;
+}
+function paintScalar(canvas, value, ref) {
+  canvas.width = 512; canvas.height = 512;
+  canvas.style.width = canvas.style.height = `${S * pixelScale()}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--panel"); ctx.fillRect(0, 0, 512, 512);
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--fg");
+  ctx.font = "bold 64px sans-serif"; ctx.textAlign = "center"; ctx.fillText(value.toFixed(4), 256, 250);
+  ctx.font = "28px sans-serif"; ctx.fillText(`unshifted: ${ref.toFixed(4)}`, 256, 320);
+}
+
+// ---------- update ----------
+let ref = null;  // output for the unshifted input, recomputed when the setting changes
+const TWIDDLE = {};
+function twiddle(n) {  // cos and sin of 2 pi u j / n, cached per size
+  if (!TWIDDLE[n]) {
+    const c = new Float32Array(n * n), sn = new Float32Array(n * n);
+    for (let u = 0; u < n; u++) for (let j = 0; j < n; j++) { const a = 2 * Math.PI * ((u * j) % n) / n; c[u * n + j] = Math.cos(a); sn[u * n + j] = Math.sin(a); }
+    TWIDDLE[n] = { c, sn };
+  }
+  return TWIDDLE[n];
+}
+function dft(x, n) {  // (n, n) real -> complex DFT (re, im), zero frequency moved to the centre
+  const { c, sn } = twiddle(n), r1 = new Float32Array(n * n), i1 = new Float32Array(n * n);
+  const re = new Float32Array(n * n), im = new Float32Array(n * n);
+  for (let i = 0; i < n; i++) for (let u = 0; u < n; u++) {  // along rows
+    let a = 0, b = 0;
+    for (let j = 0; j < n; j++) { const v = x[i * n + j]; a += v * c[u * n + j]; b -= v * sn[u * n + j]; }
+    r1[i * n + u] = a; i1[i * n + u] = b;
+  }
+  const h = Math.floor(n / 2);
+  for (let u = 0; u < n; u++) for (let v = 0; v < n; v++) {  // along columns
+    let a = 0, b = 0;
+    for (let i = 0; i < n; i++) { const cr = c[v * n + i], ci = sn[v * n + i], r = r1[i * n + u], q = i1[i * n + u]; a += r * cr + q * ci; b += q * cr - r * ci; }
+    const o = ((v + h) % n) * n + ((u + h) % n);
+    re[o] = a; im[o] = b;
+  }
+  return { re, im, n };
+}
+const useWindow = () => !!state.hann && state.spec !== "dphase";  // a window breaks the exact shift theorem of the phase-change view
+function windowed(x, n) {  // periodic Hann window w[j] = sin^2(pi j / n) along both axes
+  if (!useWindow()) return x;
+  const w = Array.from({ length: n }, (_, j) => Math.sin(Math.PI * j / n) ** 2), y = new Float32Array(n * n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) y[i * n + j] = w[i] * w[j] * x[i * n + j];
+  return y;
+}
+const spectrum = (x, n) => dft(windowed(x, n), n);
+const logMag = F => F.re.map((r, p) => Math.log1p(Math.hypot(r, F.im[p])));
+const maxOf = d => d.reduce((p, q) => Math.max(p, q), 0);
+function hsv(hue, val) {  // hue in [0, 1), full saturation, value in [0, 1] -> [r, g, b]
+  const h6 = hue * 6, i = Math.floor(h6) % 6, f = h6 - Math.floor(h6), q = val * (1 - f), t = val * f;
+  const rgb = [[val, t, 0], [q, val, 0], [0, val, t], [0, q, val], [t, 0, val], [val, 0, q]][i];
+  return rgb.map(v => Math.round(255 * v));
+}
+function paintSpectrum(canvas, F, Fref, maxLog, frame) {  // grey magnitude, or hue = phase with brightness = magnitude
+  const n = F.n, mag = logMag(F);
+  canvas.width = n; canvas.height = n;
+  const g = canvas.getContext("2d"), im = g.createImageData(n, n);
+  for (let p = 0; p < n * n; p++) {
+    const val = Math.min(1, mag[p] / maxLog);
+    let rgb;
+    if (state.spec === "mag") { const v = Math.round(255 * val); rgb = [v, v, v]; }
+    else {
+      let re = F.re[p], imv = F.im[p];
+      if (state.spec === "dphase") { const a = Fref.re[p], b = Fref.im[p]; [re, imv] = [re * a + imv * b, imv * a - re * b]; }  // F conj(F_ref)
+      rgb = hsv((Math.atan2(imv, re) / (2 * Math.PI) + 1) % 1, val);
+    }
+    im.data.set([...rgb, 255], 4 * p);
+  }
+  g.putImageData(im, 0, 0);
+  canvas.style.width = canvas.style.height = `${n * pixelScale()}px`;
+  canvas.closest(".frame").style.width = canvas.closest(".frame").style.height = `${frame * pixelScale()}px`;
+}
+const SPEC_CAPTIONS = { mag: "log(1 + |F|)", phase: "arg F (hue), log(1 + |F|) (brightness)", dphase: "arg(F(Tₜx) / F(x)) (hue)" };
+const specCaption = () => SPEC_CAPTIONS[state.spec] + (useWindow() ? ", Hann window" : "");
+let refInF = null, refOutF = null, maxIn = 1, maxOut = 1;  // spectra for the unshifted input and its output, per setting
+function recomputeRef() {
+  ref = forward(base);
+  if (state.spec !== "none") {
+    refInF = spectrum(base, S); maxIn = maxOf(logMag(refInF));
+    if (!("scalar" in ref)) { refOutF = spectrum(ref.data, ref.n); maxOut = maxOf(logMag(refOutF)); }
+  }
+}
+function render() { renderPanels(); applyView(); }
+function renderPanels() {
+  const x = shiftImg(base, state.tx, state.ty), y = forward(x);
+  const k = KERNELS[state.kernel].k, p = padAmount(k);
+  const frame = Math.max(S + 2 * p, "scalar" in y ? 0 : y.n);  // padded input, or a larger output
+  paint(document.getElementById("cIn"), padded(x, p, state.pad), S + 2 * p, 0, 1, frame);  // input shown with its padding
+  setMapping(document.getElementById("cIn"), -p, 1);
+  document.getElementById("capIn").textContent = `${S}×${S}`;
+  $("credit").innerHTML = CREDITS[state.image] ?? ""; $("credit").classList.toggle("hide", !CREDITS[state.image]);
+  if ("scalar" in y) {
+    paintScalar(document.getElementById("cOut"), y.scalar, ref.scalar);
+    delete $("cOut").parentElement.dataset.st;  // a single value: not zoomed
+    document.getElementById("capOut").textContent = "1×1";
+    if (state.spec !== "none") {
+      paintSpectrum(document.getElementById("cInF"), state.spec === "mag" && !useWindow() ? refInF : spectrum(x, S), refInF, maxIn, frame);
+      $("capInF").textContent = specCaption();
+      setMapping(document.getElementById("cInF"), 0, 1);
+    }
+    $("figOutF").classList.add("hide");
+    return;
+  }
+  // output range: min to max of the output for the unshifted input, fixed while shifting so changes stay visible
+  let lo = Infinity, hi = -Infinity;
+  for (const v of ref.data) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  paint(document.getElementById("cOut"), y.data, y.n, lo, hi, frame);
+  setMapping(document.getElementById("cOut"), (S - y.n * totalStride()) / 2, totalStride());  // output pixel j sits at input j * stride (+ border offset)
+  document.getElementById("capOut").textContent = `${y.n}×${y.n}`;
+  if (state.spec !== "none") {
+    $("figOutF").classList.remove("hide");
+    // the magnitude is shift invariant without a window; a windowed spectrum changes slightly under shifts
+    paintSpectrum(document.getElementById("cInF"), state.spec === "mag" && !useWindow() ? refInF : spectrum(x, S), refInF, maxIn, frame);
+    paintSpectrum(document.getElementById("cOutF"), spectrum(y.data, y.n), refOutF, maxOut, frame);
+    setMapping(document.getElementById("cInF"), 0, 1); setMapping(document.getElementById("cOutF"), 0, S / y.n);  // spectra zoom the same fraction
+    $("capInF").textContent = specCaption();
+    $("capOutF").textContent = specCaption().replace("Tₜx) / F(x)", "f(Tₜx)) / F(f(x))");
+  }
+}
+function settingChanged() { state.tx = snapShift(state.tx); state.ty = snapShift(state.ty); recomputeRef(); render(); writeHash(); syncControls(); }
+
+// ---------- controls ----------
+const syncSeg = segButtons([["op", "op"], ["stride", "stride"], ["pad", "pad"], ["padn", "padn"], ["act", "act"]], state, settingChanged);
+function syncControls() {
+  $("spec").value = state.spec;
+  $("hann").checked = !!state.hann; $("hann").disabled = state.spec === "dphase";
+  $("hannRow").classList.toggle("hide", state.spec === "none");
+  for (const el of document.querySelectorAll("figure.spec")) el.classList.toggle("hide", state.spec === "none");
+  $("image").value = state.image; $("kernel").value = state.kernel; $("pool").value = state.pool;
+  $("snap").checked = !!state.snap;
+  for (const id of ["tx", "ty"]) $(id).step = shiftStep();
+  $("tx").value = state.tx; $("txOut").textContent = state.tx; $("ty").value = state.ty; $("tyOut").textContent = state.ty;
+  syncSeg();
+  const kern = KERNELS[state.kernel], grid = $("kernelGrid");
+  grid.style.gridTemplateColumns = `repeat(${kern.k}, 1fr)`;
+  grid.innerHTML = "";
+  kern.w.forEach((v, p) => {
+    const inp = document.createElement("input");
+    inp.type = state.kernel === "custom" ? "number" : "text"; inp.step = "0.1";
+    inp.value = Math.abs(v) < 1e-9 ? "0" : String(+v.toFixed(kern.k > 3 ? 2 : 3));  // two decimals fit a 7 x 7 grid
+    if (kern.k > 3) inp.style.fontSize = "10px";
+    inp.style.background = kernelColor(v, Math.max(...kern.w.map(Math.abs)));
+    if (state.kernel === "custom") inp.addEventListener("change", () => { KERNELS.custom.w[p] = Number(inp.value) || 0; settingChanged(); });
+    else inp.readOnly = true;
+    grid.appendChild(inp);
+  });
+}
+function buildControls() {
+  for (const [key, kern] of Object.entries(KERNELS)) { const o = document.createElement("option"); o.value = key; o.textContent = kern.label; $("kernel").appendChild(o); }
+  $("image").addEventListener("change", async e => {
+    state.image = e.target.value;
+    if (state.image === "upload") { $("file").click(); return; }
+    await loadImage(); settingChanged();
+  });
+  $("file").addEventListener("change", e => {
+    const f = e.target.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = async () => { uploaded = rd.result; await loadImage(); settingChanged(); };
+    rd.readAsDataURL(f);
+  });
+  $("kernel").addEventListener("change", e => {
+    const prev = KERNELS[state.kernel];
+    state.kernel = e.target.value;
+    if (state.kernel === "custom" && prev.k === 3 && prev !== KERNELS.custom) KERNELS.custom.w = [...prev.w];
+    settingChanged();
+  });
+  $("pool").addEventListener("change", e => { state.pool = e.target.value; settingChanged(); });
+  $("spec").addEventListener("change", e => { state.spec = e.target.value; settingChanged(); });
+  $("hann").addEventListener("change", e => { state.hann = e.target.checked ? 1 : 0; settingChanged(); });
+  for (const key of ["tx", "ty"]) $(key).addEventListener("input", e => { state[key] = snapShift(Number(e.target.value)); render(); writeHash(); syncControls(); });
+  $("snap").addEventListener("change", e => { state.snap = e.target.checked ? 1 : 0; state.tx = snapShift(state.tx); state.ty = snapShift(state.ty); settingChanged(); });
+  $("reset").addEventListener("click", () => { stop(); state.tx = 0; state.ty = 0; render(); writeHash(); syncControls(); });
+  $("play").addEventListener("click", () => timer ? stop() : start());
+  copyLink($("copy"));
+  document.addEventListener("keydown", e => {
+    if (["INPUT", "SELECT"].includes(e.target.tagName) && e.target.type !== "range") return;
+    const d = { ArrowRight: [1, 0], ArrowLeft: [-1, 0], ArrowDown: [0, 1], ArrowUp: [0, -1] }[e.key];
+    const st = shiftStep();
+    if (d) { e.preventDefault(); state.tx = snapShift(state.tx + st * d[0]); state.ty = snapShift(state.ty + st * d[1]); render(); writeHash(); syncControls(); }
+    if (e.key === " ") { e.preventDefault(); timer ? stop() : start(); }
+  });
+}
+function totalStride() { return state.stride * (state.pool === "maxpool" || state.pool === "avgpool" ? 2 : 1); }
+function shiftStep() { return state.snap ? totalStride() : 1; }
+function snapShift(t) {  // clamp to the slider range and, if requested, round to a multiple of the total stride
+  const st = shiftStep(), lim = Math.floor(16 / st) * st;
+  return Math.max(-lim, Math.min(lim, Math.round(t / st) * st));
+}
+let timer = null, dir = 1;
+function start() {
+  $("play").textContent = "❚❚ pause";
+  timer = setInterval(() => {
+    const st = shiftStep(), top = Math.max(8, 2 * st);  // at least two steps of the total stride
+    if (state.tx >= top) dir = -1; else if (state.tx <= 0) dir = 1;
+    state.tx = snapShift(state.tx + dir * st); render(); syncControls();
+  }, 500);
+}
+function stop() { clearInterval(timer); timer = null; $("play").textContent = "▶ play"; writeHash(); }
+
+const zoom = zoomController({ size: () => S });
+function setMapping(canvas, a, st) { zoom.setMapping(canvas.parentElement, a, st); }
+function applyView() { zoom.apply(); }
+
+window.addEventListener("resize", () => render());
+window.addEventListener("hashchange", async () => { clearInterval(timer); timer = null; $("play").textContent = "▶ play"; readHash(); await loadImage(); settingChanged(); });
+readHash(); buildControls(); zoom.bind(); await loadImage(); settingChanged();
+</script>
+</body>
+</html>

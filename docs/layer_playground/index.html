@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conv layer playground</title>
+<link rel="stylesheet" href="../common/demo.css">
+<!--
+  Companion to the filter playground: one conv layer with C_in = 3 input channels (RGB) and up to four filters, as
+  nn.Conv2d(3, C_out, k, stride, padding=k // 2): correlation with zero "same" padding. Each filter row shows the
+  per-channel correlations X_c ⋆ W_{c',c}, which sum with the bias b_{c'} into the output channel Y_{c'}. Clicking a
+  pixel marks the C_in × k × k patch behind it; layers added in the panel (conv, strided conv, 2×2 max pooling;
+  geometry only) show the receptive field of one unit per layer as nested squares on the input.
+  The default image is synthetic (coloured shapes, 120 × 120); uploads stay in the browser.
+  State is kept in the URL hash, e.g. #k=1&f1=rg&f2=gray or #stack=c3,p2,c3.
+-->
+<style>
+  main { grid-template-columns: 250px minmax(0, 1fr); }
+  .stack button { width: 100%; margin: 2px 0; text-align: left; }
+  .params { font-variant-numeric: tabular-nums; }
+  /* columns grow with their captions and tables, so nothing is clipped at 1 px per image pixel */
+  #grid { display: grid; gap: 10px 12px; align-content: start; justify-content: start; }
+  figcaption { margin-bottom: 3px; font-size: 13px; min-height: 24px; line-height: 24px; white-space: nowrap; }
+  canvas { background: var(--panel); }
+  canvas.swatch { display: inline-block; width: 22px; height: 22px; border: 1px solid var(--line); vertical-align: middle; margin-right: 6px; }
+  .frame { cursor: crosshair; outline: 1px solid var(--line); }
+  .filter { background: var(--panel); border-radius: 8px; padding: 6px 8px; font-size: 13px; max-width: var(--cell); }
+  .filter b { display: block; margin-bottom: 4px; }
+  .filter .row { gap: 6px; margin: 4px 0 0; }
+  .filter input[type=number] { width: 64px; }
+  .value { font-variant-numeric: tabular-nums; color: var(--muted); margin-top: 4px; }
+  #rf .hint { max-width: var(--cell); }
+</style>
+</head>
+<body>
+<main>
+  <aside>
+    <h1>Conv layer playground</h1>
+    <fieldset>
+      <legend>Image</legend>
+      <select id="image">
+        <option value="shapes">coloured shapes</option>
+        <option value="upload">upload image…</option>
+      </select>
+      <input type="file" id="file" accept="image/*" class="hide">
+    </fieldset>
+    <fieldset>
+      <legend>Kernel size <i>k</i></legend>
+      <div class="seg" id="k"><button data-v="1">1</button><button data-v="3">3</button><button data-v="5">5</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Stride</legend>
+      <div class="seg" id="stride"><button data-v="1">1</button><button data-v="2">2</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Filters <i>C</i><sub>out</sub></legend>
+      <div class="seg" id="cout"><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button><button data-v="4">4</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Activation</legend>
+      <div class="seg" id="relu"><button data-v="0">none</button><button data-v="1">ReLU</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>Parameters</legend>
+      <div class="params" id="params"></div>
+    </fieldset>
+    <fieldset class="stack">
+      <legend>Layers above (receptive field)</legend>
+      <button data-add="c3">+ conv 3×3</button>
+      <button data-add="c3s2">+ conv 3×3, stride 2</button>
+      <button data-add="p2">+ max pool 2×2</button>
+      <div class="seg"><button id="pop">remove last</button><button id="clear">clear</button></div>
+      <p class="hint">Click a pixel to mark its patch and receptive fields; pinch on an image zooms (double-click resets). <a href="#" id="copy">Copy link</a></p>
+    </fieldset>
+  </aside>
+  <section id="grid"></section>
+</main>
+<script type="module">
+import { $, sub, SERIES, hashState, segButtons, copyLink, zoomController, paintPixels, gray, diverging } from "../common/demo.js";
+const S = 120, CH = ["R", "G", "B"], CH_COLOR = ["#e06666", "#6cb36a", "#5b8fc9"];
+const LAYER_COLORS = SERIES;  // receptive-field squares, layer 1, 2, ...
+
+// ---------- filters: three k x k kernels (R, G, B) per preset ----------
+const SOBEL_X = [-1, 0, 1, -2, 0, 2, -1, 0, 1], SOBEL_Y = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+function embed(w3, k, scale) {  // a 3x3 kernel in the centre of a k x k kernel; zero for k = 1
+  const w = new Float32Array(k * k), r = (k - 3) / 2;
+  if (k >= 3) for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) w[(a + r) * k + b + r] = w3[a * 3 + b] * scale;
+  return w;
+}
+function centre(k, v) { const w = new Float32Array(k * k); w[((k - 1) / 2) * k + (k - 1) / 2] = v; return w; }
+const PRESETS = {
+  rg: { label: "red − green", w: k => [centre(k, 1), centre(k, -1), centre(k, 0)] },
+  red: { label: "red channel", w: k => [centre(k, 1), centre(k, 0), centre(k, 0)] },
+  gray: { label: "brightness (mean)", w: k => [centre(k, 1 / 3), centre(k, 1 / 3), centre(k, 1 / 3)] },
+  blur: { label: "blur, all channels", w: k => [0, 1, 2].map(() => new Float32Array(k * k).fill(1 / (3 * k * k))) },
+  sobelx: { label: "Sobel x, all channels", k3: true, w: k => [0, 1, 2].map(() => embed(SOBEL_X, k, 1 / 3)) },
+  sobely: { label: "Sobel y, all channels", k3: true, w: k => [0, 1, 2].map(() => embed(SOBEL_Y, k, 1 / 3)) },
+  sobelxr: { label: "Sobel x, red only", k3: true, w: k => [embed(SOBEL_X, k, 1), centre(k, 0), centre(k, 0)] },
+  zero: { label: "zero", w: k => [0, 1, 2].map(() => new Float32Array(k * k)) },
+};
+
+// ---------- state and URL ----------
+const DEFAULTS = { image: "shapes", k: 3, stride: 1, cout: 2, relu: 0, f1: "rg", f2: "sobelx", f3: "red", f4: "blur", b1: 0, b2: 0, b3: 0, b4: 0, stack: "", x: -1, y: -1 };
+const { state, read: readHash, write: writeHash } = hashState(DEFAULTS, state => {
+  if (![1, 3, 5].includes(state.k)) state.k = DEFAULTS.k;
+  if (![1, 2].includes(state.stride)) state.stride = DEFAULTS.stride;
+  state.cout = Math.min(4, Math.max(1, Math.round(state.cout) || DEFAULTS.cout));
+  for (let i = 1; i <= 4; i++) if (!PRESETS[state[`f${i}`]]) state[`f${i}`] = DEFAULTS[`f${i}`];
+  state.image = "shapes";  // uploads are not part of a link
+}, { skip: ["image"] });
+
+// ---------- images: three channels in [0, 1], S x S ----------
+let X = shapes();
+function shapes() {  // coloured shapes on a dark background, so that channel-specific filters differ visibly
+  const X = [0, 1, 2].map(() => new Float32Array(S * S).fill(0.12));
+  const set = (i, j, rgb) => rgb.forEach((v, c) => { X[c][i * S + j] = v; });
+  for (let i = 0; i < S; i++) for (let j = 0; j < S; j++) {
+    if ((i - 30) ** 2 + (j - 28) ** 2 <= 16 ** 2) set(i, j, [0.9, 0.15, 0.15]);  // red disk
+    if (i >= 14 && i < 46 && j >= 58 && j < 90) set(i, j, [0.2, 0.8, 0.25]);  // green square
+    if (i >= 60 && i < 106 && j >= 8 && j - 8 <= (i - 60)) set(i, j, [0.2, 0.35, 0.9]);  // blue triangle
+    const ring = (i - 82) ** 2 + (j - 78) ** 2;
+    if (ring <= 18 ** 2 && ring >= 11 ** 2) set(i, j, [0.95, 0.85, 0.1]);  // yellow ring (red + green)
+    if (j >= 104 && j < 109 && i >= 10 && i < 108) set(i, j, [1, 1, 1]);  // white bar
+    if (i >= 110 && i < 117 && j >= 8 && j < 112) {  // hue gradient
+      const h = (j - 8) / 104 * 6, f = h - Math.floor(h), q = [[1, f, 0], [1 - f, 1, 0], [0, 1, f], [0, 1 - f, 1], [f, 0, 1], [1, 0, 1 - f]][Math.floor(h) % 6];
+      set(i, j, q.map(v => 0.15 + 0.8 * v));
+    }
+  }
+  return X;
+}
+function loadFile(file) {  // centre square crop, resized to S x S
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement("canvas"); c.width = S; c.height = S;
+    const g = c.getContext("2d"), side = Math.min(img.width, img.height);
+    g.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, S, S);
+    const d = g.getImageData(0, 0, S, S).data;
+    X = [0, 1, 2].map(ch => Float32Array.from({ length: S * S }, (_, p) => d[4 * p + ch] / 255));
+    URL.revokeObjectURL(img.src); render();
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+// ---------- one conv layer: correlation, zero "same" padding ----------
+function outSize(n, k, s) { return Math.floor((n - 1) / s) + 1; }  // same padding p = (k - 1) / 2
+function correlate(x, w, k, s) {
+  const p = (k - 1) / 2, n = outSize(S, k, s), y = new Float32Array(n * n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    let acc = 0;
+    for (let a = 0; a < k; a++) {
+      const r = i * s + a - p;
+      if (r < 0 || r >= S) continue;
+      for (let b = 0; b < k; b++) {
+        const c = j * s + b - p;
+        if (c >= 0 && c < S) acc += w[a * k + b] * x[r * S + c];
+      }
+    }
+    y[i * n + j] = acc;
+  }
+  return y;
+}
+function forward() {
+  const { k, stride: s } = state, n = outSize(S, k, s), rows = [];
+  for (let f = 1; f <= state.cout; f++) {
+    const W = PRESETS[state[`f${f}`]].w(k), b = state[`b${f}`];
+    const partial = W.map((w, c) => correlate(X[c], w, k, s));
+    const y = new Float32Array(n * n);
+    for (let q = 0; q < n * n; q++) { const v = partial[0][q] + partial[1][q] + partial[2][q] + b; y[q] = state.relu ? Math.max(0, v) : v; }
+    rows.push({ W, b, partial, y });
+  }
+  return { n, rows };
+}
+
+// ---------- receptive field of a stack (geometry only, per axis) ----------
+function stackLayers() {  // layer 1 is the conv layer above; then the added layers
+  const layers = [{ name: `conv ${state.k}×${state.k}${state.stride > 1 ? `, stride ${state.stride}` : ""}`, t: "c", k: state.k, s: state.stride }];
+  for (const tok of state.stack.split(",").filter(Boolean)) {
+    const m = tok.match(/^([cp])(\d)(?:s(\d))?$/);
+    if (!m) continue;
+    if (m[1] === "p") layers.push({ name: "max pool 2×2", t: "p", k: 2, s: 2 });
+    else layers.push({ name: `conv ${m[2]}×${m[2]}${m[3] > 1 ? `, stride ${m[3]}` : ""}`, t: "c", k: Number(m[2]), s: Number(m[3] || 1) });
+  }
+  let n = S;
+  for (const L of layers) { L.n = L.t === "p" ? Math.floor(n / 2) : outSize(n, L.k, L.s); n = L.n; }
+  return layers;
+}
+function rfOf(layers, l, u) {  // input interval [lo, hi] of unit u in layer l (0-based layer index)
+  let lo = u, hi = u;
+  for (let m = l; m >= 0; m--) {
+    const L = layers[m], p = L.t === "p" ? 0 : (L.k - 1) / 2;
+    lo = lo * L.s - p; hi = hi * L.s - p + L.k - 1;
+  }
+  return [lo, hi];
+}
+function unitNear(layers, l, x) {  // unit of layer l whose receptive field is centred closest to input coordinate x
+  const c = u => { const [lo, hi] = rfOf(layers, l, u); return (lo + hi) / 2; };
+  const n = layers[l].n, J = n > 1 ? c(1) - c(0) : 1;
+  return Math.max(0, Math.min(n - 1, Math.round((x - c(0)) / J)));
+}
+
+// ---------- drawing ----------
+let scale = 1;
+function paint(canvas, n, pixel) { paintPixels(canvas, n, n, pixel); canvas.style.width = canvas.style.height = `${n * scale}px`; }
+function maxAbs(arrs) { let m = 0; for (const a of arrs) for (const v of a) m = Math.max(m, Math.abs(v)); return m; }
+function pixelScale() {
+  const dpr = window.devicePixelRatio || 1, avail = ($("grid").clientWidth - 4 * 12) / 5;
+  return Math.min(3, Math.max(1, Math.floor(avail * dpr / S) / dpr));
+}
+function mapCell(id, caption, n, a, st) {  // figure with a frame, an inner wrapper (zoomed) and an SVG overlay
+  return `<figure><figcaption>${caption}</figcaption><div class="frame" style="width:${S * scale}px;height:${S * scale}px">
+    <div class="inner" data-a="${a}" data-st="${st}"><canvas id="${id}"></canvas><svg id="${id}_ov" viewBox="0 0 ${n} ${n}" preserveAspectRatio="none"></svg></div></div></figure>`;
+}
+function swatch(w, k, vmax) {
+  const c = document.createElement("canvas"); c.className = "swatch";
+  paintPixels(c, k, k, q => diverging(w[q], vmax));
+  c.title = Array.from({ length: k }, (_, a) => Array.from(w.slice(a * k, a * k + k), v => v.toFixed(2)).join("  ")).join("\n");
+  return c;
+}
+function rect(svgId, x0, y0, w, h, color) {
+  $(svgId).insertAdjacentHTML("beforeend", `<rect x="${x0}" y="${y0}" width="${w}" height="${h}" stroke="${color}"/>`);
+}
+
+function render() {
+  scale = pixelScale();
+  const { n, rows } = forward(), s = state.stride, a = (S - n * s) / 2;
+  const grid = $("grid");
+  grid.style.gridTemplateColumns = "repeat(5, auto)";
+  grid.style.setProperty("--cell", `${S * scale}px`);
+  let html = mapCell("rgb", "input <span>RGB, 3 × 120 × 120</span>", S, 0, 1);
+  CH.forEach((c, i) => { html += mapCell(`x${i}`, `<span class="dot" style="background:${CH_COLOR[i]}"></span>${sub("X", c)}`, S, 0, 1); });
+  html += `<figure><figcaption>receptive field</figcaption><div id="rf"></div></figure>`;
+  rows.forEach((r, f) => {
+    const fi = f + 1;
+    html += `<div class="filter"><b>filter ${sub("W", fi)} <span style="font-weight:400;color:var(--muted)">3×${state.k}×${state.k}</span></b>
+      <select data-f="${fi}">${Object.entries(PRESETS).map(([key, p]) => `<option value="${key}"${state[`f${fi}`] === key ? " selected" : ""}>${p.label}</option>`).join("")}</select>
+      <div class="row">bias ${sub("b", fi)} <input type="number" step="0.1" data-b="${fi}" value="${state[`b${fi}`]}"></div>
+      <div class="value" id="val${fi}"></div>${PRESETS[state[`f${fi}`]].k3 && state.k < 3 ? `<p class="hint">needs <i>k</i> ≥ 3, zero for <i>k</i> = 1</p>` : ""}</div>`;
+    CH.forEach((c, i) => { html += mapCell(`p${f}_${i}`, `<span id="sw${f}_${i}"></span>${sub("X", c)} ⋆ ${sub("W", `${fi},${c}`)}`, n, a, s); });
+    html += mapCell(`y${f}`, `${sub("Y", fi)} <span>= Σ + ${sub("b", fi)}${state.relu ? ", ReLU" : ""}</span>`, n, a, s);
+  });
+  grid.innerHTML = html;
+
+  // input, channels and maps
+  paint($("rgb"), S, q => X.map(ch => Math.round(255 * Math.max(0, Math.min(1, ch[q])))));
+  X.forEach((ch, i) => paint($(`x${i}`), S, q => gray(ch[q], 1)));
+  rows.forEach((r, f) => {
+    const vmax = maxAbs(r.partial) || 1, wmax = maxAbs(r.W) || 1, ymax = state.relu ? Math.max(...r.y) : (maxAbs([r.y]) || 1);
+    r.partial.forEach((pm, i) => {
+      paint($(`p${f}_${i}`), n, q => diverging(pm[q], vmax));
+      $(`sw${f}_${i}`).appendChild(swatch(r.W[i], state.k, wmax));
+    });
+    paint($(`y${f}`), n, q => state.relu ? gray(r.y[q], ymax) : diverging(r.y[q], ymax));
+  });
+  bindGrid(); drawSelection(rows, n); drawParams(n); zoom.apply();
+}
+
+function drawSelection(rows, n) {
+  const layers = stackLayers(), k = state.k;
+  const tbl = layers.map((L, l) => {
+    const rf = rfOf(layers, l, 0), jump = layers.slice(0, l + 1).reduce((p, M) => p * M.s, 1);
+    return `<tr><td><span class="dot" style="background:${LAYER_COLORS[l % LAYER_COLORS.length]}"></span>${l + 1}: ${L.name}</td><td>${rf[1] - rf[0] + 1}</td><td>${jump}</td><td>${L.n}</td></tr>`;
+  }).join("");
+  $("rf").innerHTML = `<table><tr><th>layer</th><th>RF</th><th>jump</th><th>size</th></tr>${tbl}</table>
+    <p class="hint">RF: input pixels per axis that can affect one unit; jump: input pixels between neighbouring units</p>`;
+  if (state.x < 0) { rows.forEach((_, f) => { $(`val${f + 1}`).textContent = "click a pixel"; }); return; }
+  // nested receptive fields of the units nearest to the click, one square per layer
+  layers.forEach((L, l) => {
+    const u = unitNear(layers, l, state.x), v = unitNear(layers, l, state.y);
+    const [x0, x1] = rfOf(layers, l, u), [y0, y1] = rfOf(layers, l, v);
+    rect("rgb_ov", x0, y0, x1 - x0 + 1, y1 - y0 + 1, LAYER_COLORS[l % LAYER_COLORS.length]);
+  });
+  // the C_in x k x k patch of the layer-1 unit, and the unit itself in every layer-1 map
+  const u = unitNear(layers, 0, state.x), v = unitNear(layers, 0, state.y), p = (k - 1) / 2, s = state.stride;
+  CH.forEach((_, i) => rect(`x${i}_ov`, u * s - p, v * s - p, k, k, LAYER_COLORS[0]));
+  rows.forEach((r, f) => {
+    CH.forEach((_, i) => rect(`p${f}_${i}_ov`, u, v, 1, 1, LAYER_COLORS[0]));
+    rect(`y${f}_ov`, u, v, 1, 1, LAYER_COLORS[0]);
+    const terms = r.partial.map(pm => pm[v * n + u]);
+    const signed = [...terms, r.b].map((t, q) => (q === 0 ? (t < 0 ? "−" : "") : (t < 0 ? " − " : " + ")) + Math.abs(t).toFixed(2)).join("");
+    $(`val${f + 1}`).innerHTML = `${sub("Y", f + 1)}[${v}, ${u}] = ${state.relu ? `ReLU(${signed})` : signed} = ${r.y[v * n + u].toFixed(2)}`;
+  });
+}
+function drawParams(n) {
+  const { k, cout } = state, w = cout * 3 * k * k;
+  $("params").innerHTML = `weights (${cout}, 3, ${k}, ${k}): ${w}<br>biases: ${cout}<br>total: ${w + cout} = ${sub("C", "out")}(${sub("C", "in")}<i>k</i>² + 1)<br>output: ${cout} × ${n} × ${n}`;
+}
+
+// ---------- controls ----------
+const syncControls = segButtons([["k", "k"], ["stride", "stride"], ["cout", "cout"], ["relu", "relu"]], state, changed);
+const zoom = zoomController({ size: () => S, onSelect: (x, y) => { state.x = x; state.y = y; writeHash(); render(); } });
+function changed() { writeHash(); syncControls(); render(); }
+function bindGrid() {
+  for (const sel of document.querySelectorAll("select[data-f]")) sel.addEventListener("change", e => { state[`f${e.target.dataset.f}`] = e.target.value; changed(); });
+  for (const inp of document.querySelectorAll("input[data-b]")) inp.addEventListener("change", e => { state[`b${e.target.dataset.b}`] = Number(e.target.value) || 0; changed(); });
+  zoom.bind();
+}
+function buildControls() {
+  for (const b of document.querySelectorAll("button[data-add]")) b.addEventListener("click", () => { state.stack = [state.stack, b.dataset.add].filter(Boolean).join(","); changed(); });
+  $("pop").addEventListener("click", () => { state.stack = state.stack.split(",").slice(0, -1).join(","); changed(); });
+  $("clear").addEventListener("click", () => { state.stack = ""; changed(); });
+  $("image").addEventListener("change", e => { if (e.target.value === "upload") $("file").click(); else { X = shapes(); render(); } });
+  $("file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  copyLink($("copy"));
+}
+
+window.addEventListener("resize", () => render());
+window.addEventListener("hashchange", () => { readHash(); syncControls(); render(); });
+readHash(); buildControls(); syncControls(); render();
+</script>
+</body>
+</html>

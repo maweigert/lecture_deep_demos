@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optimizer playground</title>
+<link rel="stylesheet" href="../common/demo.css">
+<!--
+  Gradient descent, momentum and Adam on three two-parameter loss surfaces (lecture 2). Click the plot to choose
+  a start point; sliders set the step sizes, momentum, number of steps and gradient noise. No URL state.
+-->
+<style>
+  :root { --gd: #1f77b4; --mom: #ff7f0e; --adam: #2ca02c; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  p.sub { margin: 0 0 12px; color: var(--muted); }
+  .plots { display: grid; gap: 12px; }
+  canvas { width: 100%; image-rendering: auto; border-radius: 8px; background: var(--panel); }
+  #field { aspect-ratio: 16 / 9; cursor: crosshair; }
+  #loss { aspect-ratio: 16 / 4; }
+  aside { padding: 14px; }
+  fieldset { margin: 0 0 14px; }
+  legend { margin-bottom: 6px; }
+  label { display: block; margin: 8px 0 2px; }
+  label span { float: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  input[type=range], select { width: 100%; }
+  .toggle { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .swatch { width: 14px; height: 4px; border-radius: 2px; display: inline-block; }
+  button { padding: 6px 12px; }
+  button:hover { border-color: var(--accent); }
+  .row { gap: 8px; flex-wrap: wrap; margin: 0; }
+  .hint { font-size: 0.85rem; margin-top: 10px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>Optimizer playground</h1>
+    <p class="sub">Gradient descent, momentum and Adam on a two-parameter loss. Click the plot to choose a start point.</p>
+    <div class="plots">
+      <canvas id="field"></canvas>
+      <canvas id="loss"></canvas>
+    </div>
+  </section>
+  <aside>
+    <fieldset>
+      <legend>Loss surface</legend>
+      <select id="surface">
+        <option value="valley">Narrow valley (axis-aligned)</option>
+        <option value="rotated">Narrow valley (rotated 30°)</option>
+        <option value="rosen">Curved valley (Rosenbrock)</option>
+      </select>
+    </fieldset>
+    <fieldset>
+      <legend>Methods</legend>
+      <div class="toggle"><input type="checkbox" id="useGd" checked><span class="swatch" style="background:var(--gd)"></span>Plain GD</div>
+      <div class="toggle"><input type="checkbox" id="useMom" checked><span class="swatch" style="background:var(--mom)"></span>SGD with momentum</div>
+      <div class="toggle"><input type="checkbox" id="useAdam"><span class="swatch" style="background:var(--adam)"></span>Adam</div>
+    </fieldset>
+    <fieldset>
+      <legend>Settings</legend>
+      <label>Learning rate η (GD, momentum) <span id="lrVal"></span></label>
+      <input type="range" id="lr" min="-4" max="0.5" step="0.01">
+      <label>Momentum β (also Adam β₁) <span id="betaVal"></span></label>
+      <input type="range" id="beta" min="0" max="0.99" step="0.01" value="0.5">
+      <label>Adam learning rate <span id="adamLrVal"></span></label>
+      <input type="range" id="adamLr" min="-3" max="0.5" step="0.01">
+      <label>Steps <span id="stepsVal"></span></label>
+      <input type="range" id="steps" min="5" max="400" step="1" value="40">
+      <label>Gradient noise (minibatch-like) <span id="noiseVal"></span></label>
+      <input type="range" id="noise" min="0" max="1" step="0.01" value="0">
+    </fieldset>
+    <div class="row">
+      <button id="animate">Animate</button>
+      <button id="reset">Reset start</button>
+    </div>
+    <p class="hint">Momentum uses the running-average form m ← βm + (1−β)g, θ ← θ − ηm. Adam uses β₂ = 0.999 and bias correction. ★ marks the minimum.</p>
+  </aside>
+</main>
+<script type="module">
+import { $ } from "../common/demo.js";
+{
+  const SURFACES = {
+    valley: {
+      f: ([x, y]) => 0.5 * (x * x + 25 * y * y),
+      g: ([x, y]) => [x, 25 * y],
+      box: [-10, 4, -3, 3], start: [-9, 1.5], min: [0, 0], lr: 0.075, adamLr: 0.5, steps: 40,
+    },
+    rotated: (() => {
+      const c = Math.cos(Math.PI / 6), s = Math.sin(Math.PI / 6);
+      const rot = ([x, y]) => [c * x + s * y, -s * x + c * y];
+      return {
+        f: (p) => { const [u, v] = rot(p); return 0.5 * (u * u + 25 * v * v); },
+        g: (p) => { const [u, v] = rot(p); const gu = u, gv = 25 * v; return [c * gu - s * gv, s * gu + c * gv]; },
+        box: [-10, 4, -5, 3], start: [-8, -2], min: [0, 0], lr: 0.075, adamLr: 0.5, steps: 40,
+      };
+    })(),
+    rosen: {
+      f: ([x, y]) => (1 - x) ** 2 + 100 * (y - x * x) ** 2,
+      g: ([x, y]) => [-2 * (1 - x) - 400 * x * (y - x * x), 200 * (y - x * x)],
+      box: [-2, 2, -1, 3], start: [-1.2, 1], min: [1, 1], lr: 0.0008, adamLr: 0.02, steps: 400,
+    },
+  };
+
+  const field = $("field"), lossCv = $("loss");
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  let surf = SURFACES.valley, start = surf.start.slice(), animFrame = null, shown = Infinity;
+
+  // Deterministic Gaussian noise so that slider changes do not reshuffle the noise
+  function rng(seed) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6D2B79F5) >>> 0; let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function gaussPairs(n, seed) {
+    const r = rng(seed), out = [];
+    for (let i = 0; i < n; i++) {
+      const u = Math.max(r(), 1e-12), v = r(), m = Math.sqrt(-2 * Math.log(u));
+      out.push([m * Math.cos(2 * Math.PI * v), m * Math.sin(2 * Math.PI * v)]);
+    }
+    return out;
+  }
+
+  function run(method, p) {
+    const { lr, beta, adamLr, steps, noise } = p;
+    let th = start.slice(), m = [0, 0], v = [0, 0];
+    const path = [th.slice()], eps = gaussPairs(steps, 7);
+    for (let t = 1; t <= steps; t++) {
+      let g = surf.g(th);
+      const scale = noise * Math.hypot(g[0], g[1]);
+      g = [g[0] + scale * eps[t - 1][0], g[1] + scale * eps[t - 1][1]];
+      if (method === "gd") {
+        th = [th[0] - lr * g[0], th[1] - lr * g[1]];
+      } else if (method === "mom") {
+        m = [beta * m[0] + (1 - beta) * g[0], beta * m[1] + (1 - beta) * g[1]];
+        th = [th[0] - lr * m[0], th[1] - lr * m[1]];
+      } else {
+        const b2 = 0.999;
+        m = [beta * m[0] + (1 - beta) * g[0], beta * m[1] + (1 - beta) * g[1]];
+        v = [b2 * v[0] + (1 - b2) * g[0] ** 2, b2 * v[1] + (1 - b2) * g[1] ** 2];
+        const c1 = 1 - beta ** t || 1, c2 = 1 - b2 ** t;
+        th = th.map((x, i) => x - adamLr * (m[i] / c1) / (Math.sqrt(v[i] / c2) + 1e-8));
+      }
+      if (!th.every(Number.isFinite) || Math.abs(th[0]) > 1e6 || Math.abs(th[1]) > 1e6) { path.push(th); break; }
+      path.push(th.slice());
+    }
+    return path;
+  }
+
+  function params() {
+    return {
+      lr: 10 ** +$("lr").value, beta: +$("beta").value, adamLr: 10 ** +$("adamLr").value,
+      steps: +$("steps").value, noise: +$("noise").value,
+    };
+  }
+
+  function sizeCanvas(cv) {
+    const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+    cv.width = Math.round(r.width * d); cv.height = Math.round(r.height * d);
+    const ctx = cv.getContext("2d"); ctx.setTransform(d, 0, 0, d, 0, 0);
+    return [ctx, r.width, r.height];
+  }
+
+  const VIRIDIS = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]];
+  function cmap(t) {
+    t = Math.min(1, Math.max(0, t)) * (VIRIDIS.length - 1);
+    const i = Math.min(VIRIDIS.length - 2, Math.floor(t)), f = t - i;
+    return VIRIDIS[i].map((c, k) => c + f * (VIRIDIS[i + 1][k] - c));
+  }
+
+  let bgCache = null;
+  function background(w, h) {
+    const key = `${surfKey()}-${w}-${h}`;
+    if (bgCache && bgCache.key === key) return bgCache.img;
+    const d = window.devicePixelRatio || 1, W = Math.round(w * d), H = Math.round(h * d);
+    const img = new ImageData(W, H), [x0, x1, y0, y1] = surf.box;
+    const vals = new Float32Array(W * H);
+    let lo = Infinity, hi = -Infinity;
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const val = Math.log10(surf.f([x0 + (i / W) * (x1 - x0), y1 - (j / H) * (y1 - y0)]) + 1e-3);
+      vals[j * W + i] = val; lo = Math.min(lo, val); hi = Math.max(hi, val);
+    }
+    for (let k = 0; k < W * H; k++) {
+      const t = (vals[k] - lo) / (hi - lo), band = Math.abs(((t * 14) % 1) - 0.5) < 0.04 ? 0.82 : 1;
+      const [r, g, b] = cmap(t);
+      img.data.set([r * band, g * band, b * band, 255], 4 * k);
+    }
+    bgCache = { key, img };
+    return img;
+  }
+  const surfKey = () => $("surface").value;
+
+  function draw() {
+    const p = params();
+    $("lrVal").textContent = p.lr.toPrecision(2);
+    $("betaVal").textContent = p.beta.toFixed(2);
+    $("adamLrVal").textContent = p.adamLr.toPrecision(2);
+    $("stepsVal").textContent = p.steps;
+    $("noiseVal").textContent = p.noise.toFixed(2);
+
+    const [ctx, w, h] = sizeCanvas(field), [x0, x1, y0, y1] = surf.box;
+    const X = (x) => ((x - x0) / (x1 - x0)) * w, Y = (y) => ((y1 - y) / (y1 - y0)) * h;
+    ctx.putImageData(background(w, h), 0, 0);
+
+    const methods = [["gd", "useGd", css("--gd")], ["mom", "useMom", css("--mom")], ["adam", "useAdam", css("--adam")]]
+      .filter(([, id]) => $(id).checked).map(([m, , c]) => [m, c, run(m, p)]);
+
+    for (const [, color, path] of methods) {
+      const n = Math.min(path.length, shown + 1);
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+      ctx.beginPath();
+      path.slice(0, n).forEach(([x, y], k) => (k ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y))));
+      ctx.stroke();
+      for (const [x, y] of path.slice(0, n)) { ctx.beginPath(); ctx.arc(X(x), Y(y), 2.2, 0, 2 * Math.PI); ctx.fill(); }
+    }
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = "#000"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(X(start[0]), Y(start[1]), 5, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.font = "18px sans-serif"; ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("★", X(surf.min[0]), Y(surf.min[1]));
+
+    drawLoss(methods, p.steps);
+  }
+
+  function drawLoss(methods, steps) {
+    const [ctx, w, h] = sizeCanvas(lossCv), pad = { l: 46, r: 10, t: 10, b: 24 };
+    const curves = methods.map(([, c, path]) => [c, path.map((q) => Math.max(surf.f(q), 1e-8))]);
+    const all = curves.flatMap(([, ys]) => ys.filter(Number.isFinite));
+    const lo = Math.log10(Math.max(1e-8, Math.min(...all, 1))), hi = Math.log10(Math.max(...all, 1e-6));
+    const X = (k) => pad.l + (k / steps) * (w - pad.l - pad.r);
+    const Y = (v) => pad.t + (1 - (Math.log10(v) - lo) / (hi - lo || 1)) * (h - pad.t - pad.b);
+    ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.font = "12px sans-serif"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, h - pad.b); ctx.lineTo(w - pad.r, h - pad.b); ctx.stroke();
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (let e = Math.ceil(lo); e <= Math.floor(hi); e += Math.max(1, Math.ceil((hi - lo) / 4))) ctx.fillText(`1e${e}`, pad.l - 4, Y(10 ** e));
+    ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText("step", (pad.l + w) / 2, h - pad.b + 6);
+    ctx.save(); ctx.translate(12, (h - pad.b) / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText("loss", 0, 0); ctx.restore();
+    for (const [color, ys] of curves) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+      ys.slice(0, Math.min(ys.length, shown + 1)).forEach((v, k) => {
+        const y = Math.min(h - pad.b, Math.max(pad.t, Y(v)));
+        k ? ctx.lineTo(X(k), y) : ctx.moveTo(X(k), y);
+      });
+      ctx.stroke();
+    }
+  }
+
+  function setSurface() {
+    surf = SURFACES[surfKey()]; start = surf.start.slice(); bgCache = null;
+    $("lr").value = Math.log10(surf.lr); $("adamLr").value = Math.log10(surf.adamLr); $("steps").value = surf.steps;
+    shown = Infinity; draw();
+  }
+
+  function animate() {
+    cancelAnimationFrame(animFrame); shown = 0;
+    const total = +$("steps").value, perFrame = Math.max(1, Math.round(total / 120));
+    const tick = () => { shown += perFrame; draw(); if (shown < total) animFrame = requestAnimationFrame(tick); else shown = Infinity; };
+    tick();
+  }
+
+  field.addEventListener("click", (e) => {
+    const r = field.getBoundingClientRect(), [x0, x1, y0, y1] = surf.box;
+    start = [x0 + ((e.clientX - r.left) / r.width) * (x1 - x0), y1 - ((e.clientY - r.top) / r.height) * (y1 - y0)];
+    shown = Infinity; draw();
+  });
+  for (const id of ["lr", "beta", "adamLr", "steps", "noise", "useGd", "useMom", "useAdam"]) $(id).addEventListener("input", () => { shown = Infinity; draw(); });
+  $("surface").addEventListener("change", setSurface);
+  $("animate").addEventListener("click", animate);
+  $("reset").addEventListener("click", () => { start = surf.start.slice(); shown = Infinity; draw(); });
+  window.addEventListener("resize", () => { bgCache = null; draw(); });
+  setSurface();
+}
+</script>
+</body>
+</html>

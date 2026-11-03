@@ -1,0 +1,59 @@
+{
+  "demos": [
+    {
+      "id": "conv_playground",
+      "title": "Filter playground",
+      "lecture": 3,
+      "summary": "One kernel on a grayscale image: correlation or convolution, stride, padding, ReLU, pooling, Fourier magnitude and phase, and circular shifts of the input.",
+      "presets": [
+        { "label": "Box blur on the test pattern", "hash": "kernel=box3&image=pattern" },
+        { "label": "Sobel x", "hash": "kernel=sobel_x" },
+        { "label": "Box blur 7×7", "hash": "kernel=box7&image=bridge" },
+        { "label": "Laplacian", "hash": "kernel=laplace&image=bridge" },
+        { "label": "Impulse, correlation", "hash": "image=impulse&kernel=asym&op=corr" },
+        { "label": "Impulse, convolution", "hash": "image=impulse&kernel=asym&op=conv" },
+        { "label": "Equivariance under shifts", "hash": "kernel=sobel_x&image=nuclei" },
+        { "label": "Phase change under a shift", "hash": "spec=dphase&tx=4&kernel=identity" },
+        { "label": "Frequency response of a box filter", "hash": "image=bridge&kernel=box7&spec=mag" },
+        { "label": "Aliasing with stride 2", "hash": "image=bridge&kernel=identity&stride=2" },
+        { "label": "Stride 2 after a box blur", "hash": "image=bridge&kernel=box3&stride=2" },
+        { "label": "Valid padding", "hash": "image=bridge_small&padn=0&kernel=box3" },
+        { "label": "Same padding", "hash": "image=bridge_small&padn=same&kernel=box3" },
+        { "label": "Stride breaks equivariance", "hash": "kernel=sobel_x&stride=2&image=nuclei" },
+        { "label": "Shifts in multiples of the stride", "hash": "kernel=sobel_x&stride=2&image=nuclei&snap=1&pad=circular" },
+        { "label": "ReLU after Sobel", "hash": "kernel=sobel_x&act=relu" },
+        { "label": "Max pooling", "hash": "kernel=sobel_x&pool=maxpool&image=nuclei" }
+      ]
+    },
+    {
+      "id": "layer_playground",
+      "title": "Conv layer playground",
+      "lecture": 3,
+      "summary": "One convolutional layer on an RGB image: per-channel correlations summed into output channels, parameter counts, the patch behind a pixel and receptive fields of stacked layers.",
+      "presets": [
+        { "label": "Multiple input channels", "hash": "cout=1&x=28&y=30" },
+        { "label": "Multiple output channels", "hash": "cout=3&x=28&y=30" },
+        { "label": "1×1 convolutions", "hash": "k=1&f1=rg&f2=gray&x=28&y=30" },
+        { "label": "Receptive field of two layers", "hash": "stack=c3,c3&x=60&y=60" },
+        { "label": "Receptive field with pooling", "hash": "stack=p2,c3,c3&x=60&y=60" }
+      ]
+    },
+    {
+      "id": "cnn_viewer",
+      "title": "CNN viewer",
+      "lecture": 3,
+      "summary": "Every feature map of a small MNIST network, computed in the browser: draw a digit, shift it with the arrow keys and watch the maps and class probabilities.",
+      "presets": [
+        { "label": "LeNet-5", "hash": "digit=3" },
+        { "label": "Two 7×7 convolutions with global average pooling", "hash": "model=1&digit=3" }
+      ]
+    },
+    {
+      "id": "optimizer",
+      "title": "Optimizer playground",
+      "lecture": 2,
+      "summary": "Gradient descent, momentum and Adam on three two-parameter loss surfaces, with step sizes, momentum, gradient noise and a start point chosen by clicking.",
+      "presets": []
+    }
+  ]
+}

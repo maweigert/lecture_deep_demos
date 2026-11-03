@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNN viewer</title>
+<link rel="stylesheet" href="../common/demo.css">
+<!--
+  Small CNNs trained on MNIST by scripts/train_cnn_viewer.py, which stores each model (architecture spec, float32
+  weights, test accuracy) and ten example digits in models.json; the viewer builds its layout from the spec, so any
+  model trained by the script appears here. All layers are computed in the browser: draw a digit or pick an
+  example; arrow keys shift the input (zero fill), so the feature maps move with the digit while the class
+  probabilities change little. Maps of one layer share one grey scale (black 0, white the layer maximum).
+  Hash parameters: model=<index>, digit=<0-9>.
+-->
+<style>
+  main { gap: 14px; }
+  aside { padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; }
+  aside .hint { max-width: 380px; }
+  h1 { margin: 0; }
+  fieldset { margin: 0; }
+  .seg button { min-width: 26px; }
+  #net { display: flex; gap: 8px; align-items: flex-start; overflow-x: auto; padding-bottom: 8px; }
+  .layer { flex: none; }
+  .layer h2 { font-size: 13px; margin: 0 0 2px; white-space: nowrap; }
+  .layer .shape { font-size: 12px; color: var(--muted); margin-bottom: 6px; white-space: nowrap; }
+  .maps { display: grid; gap: 4px; }
+  .pair { display: flex; gap: 3px; align-items: center; }
+  canvas { background: #000; }
+  canvas.swatch { background: var(--panel); outline: 1px solid var(--line); }
+  #pad { cursor: crosshair; touch-action: none; outline: 1px solid var(--line); }
+  .arrow { flex: none; align-self: center; color: var(--muted); font-size: 16px; margin-top: 30px; }
+  .bars { display: grid; grid-template-columns: 12px 90px 36px; gap: 3px 6px; align-items: center; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .bar { height: 14px; background: var(--blue); border-radius: 2px; }
+  .top { font-weight: 700; }
+</style>
+</head>
+<body>
+<main>
+  <aside>
+    <h1>CNN viewer</h1>
+    <fieldset>
+      <legend>Model</legend>
+      <div class="seg" id="models"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Examples</legend>
+      <div class="seg" id="examples"></div>
+    </fieldset>
+    <div class="seg"><button id="clear">clear</button><button id="center">centre</button></div>
+    <p class="hint">Draw a digit in the input. Arrow keys shift it by one pixel.</p>
+    <p class="hint" id="info"></p>
+  </aside>
+  <section id="net"></section>
+</main>
+<script type="module">
+import { $, hashState, paintPixels, gray, diverging } from "../common/demo.js";
+
+let DATA;
+try { DATA = await (await fetch("models.json")).json(); }
+catch (err) { $("info").textContent = `Could not load models.json (${err.message}). Open this demo through a web server, e.g. make serve.`; throw err; }
+function decode(b64, Type) { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return new Type(u.buffer); }
+
+// ---------- network from its spec (same grammar as train_cnn_viewer.py) ----------
+// c{k}x{C}[p{p}]: conv + ReLU; m2: max pool 2x2; g: global average pool; d{n}: dense (+ ReLU unless last)
+function parse(spec, flat) {
+  const tokens = spec.split(","), layers = []; let c = 1, n = 28, len = null, o = 0;
+  const take = size => { const w = flat.subarray(o, o + size); o += size; return w; };
+  tokens.forEach((tok, i) => {
+    let m;
+    if ((m = tok.match(/^c(\d+)x(\d+)(?:p(\d+))?$/))) {
+      const k = +m[1], cout = +m[2], p = +(m[3] || 0), w = take(cout * c * k * k), b = take(cout);
+      layers.push({ t: "conv", k, cin: c, cout, p, w, b, nin: n, title: `conv ${k}×${k}${p ? `, pad ${p}` : ""} + ReLU` });
+      c = cout; n = n + 2 * p - k + 1;
+    } else if (tok === "m2") { layers.push({ t: "pool", c, nin: n, title: "max pool 2×2" }); n = Math.floor(n / 2); }
+    else if (tok === "g") { layers.push({ t: "gap", c, nin: n, title: "global average pool" }); len = c; }
+    else if ((m = tok.match(/^d(\d+)$/))) {
+      if (len === null) len = c * n * n;
+      const nout = +m[1], last = i === tokens.length - 1;
+      layers.push({ t: "dense", nin: len, nout, w: take(nout * len), b: take(nout), relu: !last, last, title: last ? "dense + softmax" : "dense + ReLU" });
+      len = nout;
+    } else throw new Error(`unknown spec token ${tok}`);
+    const L = layers[layers.length - 1];
+    if (L.t === "conv" || L.t === "pool") Object.assign(L, { ch: c, n });  // output maps
+    else Object.assign(L, { ch: 1, len });
+  });
+  return layers;
+}
+function conv(x, L) {  // x: (cin, nin, nin) -> ReLU(correlation + b), (cout, n, n)
+  const { cin, cout, k, p, w, b, nin, n } = L, y = new Float32Array(cout * n * n);
+  for (let co = 0; co < cout; co++) for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    let acc = b[co];
+    for (let ci = 0; ci < cin; ci++) for (let a = 0; a < k; a++) {
+      const r = i + a - p; if (r < 0 || r >= nin) continue;
+      for (let q = 0; q < k; q++) { const cc = j + q - p; if (cc >= 0 && cc < nin) acc += w[((co * cin + ci) * k + a) * k + q] * x[(ci * nin + r) * nin + cc]; }
+    }
+    y[(co * n + i) * n + j] = Math.max(0, acc);
+  }
+  return y;
+}
+function pool(x, L) {  // 2x2, stride 2
+  const { c, nin, n } = L, y = new Float32Array(c * n * n);
+  for (let ch = 0; ch < c; ch++) for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    const q = (ch * nin + 2 * i) * nin + 2 * j;
+    y[(ch * n + i) * n + j] = Math.max(x[q], x[q + 1], x[q + nin], x[q + nin + 1]);
+  }
+  return y;
+}
+function gap(x, L) { const { c, nin } = L, y = new Float32Array(c); for (let ch = 0; ch < c; ch++) { let s = 0; for (let q = 0; q < nin * nin; q++) s += x[ch * nin * nin + q]; y[ch] = s / (nin * nin); } return y; }
+function dense(x, L) {
+  const { nin, nout, w, b, relu } = L, y = new Float32Array(nout);
+  for (let o = 0; o < nout; o++) { let acc = b[o]; for (let i = 0; i < nin; i++) acc += w[o * nin + i] * x[i]; y[o] = relu ? Math.max(0, acc) : acc; }
+  return y;
+}
+function forward(x) {  // activations of every layer; the last one as softmax probabilities
+  const acts = []; let a = x;
+  for (const L of net) { a = { conv, pool, gap, dense }[L.t](a, L); acts.push(a); }
+  const logits = acts[acts.length - 1], mx = Math.max(...logits), e = logits.map(v => Math.exp(v - mx)), z = e.reduce((s, v) => s + v, 0);
+  acts[acts.length - 1] = e.map(v => v / z);
+  return acts;
+}
+
+// ---------- layout from the network ----------
+const PAD_SCALE = 8;
+function canvas(w, h, s, cls = "") { const c = document.createElement("canvas"); c.width = w; c.height = h; c.style.width = `${w * s}px`; c.style.height = `${h * s}px`; if (cls) c.className = cls; return c; }
+function grayInto(c, data, offset, w, h, hi) { paintPixels(c, w, h, q => gray(data[offset + q], hi)); }
+function swatch(w, k) {  // first-layer filter in the diverging palette of the lecture figures
+  const s = Math.max(2, Math.round(20 / k)), c = canvas(k, k, s, "swatch"), m = Math.max(...w.map(Math.abs)) || 1;
+  paintPixels(c, k, k, q => diverging(w[q], m));
+  return c;
+}
+function unitGrid(len) { const w = Math.min(len, len > 64 ? 10 : len > 16 ? 8 : 4); return [Math.ceil(len / w), w]; }  // rows, columns of a vector display
+let net = [], views = [];
+function build() {
+  const el = $("net"); el.innerHTML = ""; views = [];
+  const inp = document.createElement("div"); inp.className = "layer";
+  inp.innerHTML = `<h2>input</h2><div class="shape">1 × 28 × 28</div>`;
+  const pad = canvas(28, 28, PAD_SCALE); pad.id = "pad"; inp.appendChild(pad); el.appendChild(inp);
+  net.forEach((L, l) => {
+    el.insertAdjacentHTML("beforeend", `<div class="arrow">→</div>`);
+    const div = document.createElement("div"); div.className = "layer";
+    if (L.last) {
+      div.innerHTML = `<h2>${L.title}</h2><div class="shape">${L.nout} classes</div><div class="bars">${Array.from({ length: L.nout }, (_, d) => `<span id="d${d}">${d}</span><div><div class="bar" id="b${d}"></div></div><span id="p${d}"></span>`).join("")}</div>`;
+      el.appendChild(div); views.push(null); return;
+    }
+    const maps = document.createElement("div"); maps.className = "maps";
+    const cvs = [];
+    if (L.ch > 1 || L.t === "conv" || L.t === "pool") {
+      div.innerHTML = `<h2>${L.title}</h2><div class="shape">${L.ch} × ${L.n} × ${L.n}</div>`;
+      const cols = Math.ceil(L.ch / 8), s = Math.max(1, Math.min(8, Math.floor(60 / L.n)));
+      maps.style.gridTemplateColumns = `repeat(${cols}, auto)`;
+      for (let c = 0; c < L.ch; c++) {
+        const cv = canvas(L.n, L.n, s);
+        if (l === 0 && L.t === "conv") { const pair = document.createElement("div"); pair.className = "pair"; pair.append(swatch(Array.from(L.w.subarray(c * L.k * L.k, (c + 1) * L.k * L.k)), L.k), cv); maps.appendChild(pair); }
+        else maps.appendChild(cv);
+        cvs.push(cv);
+      }
+    } else {
+      div.innerHTML = `<h2>${L.title}</h2><div class="shape">${L.len}</div>`;
+      const [h, w] = unitGrid(L.len), cv = canvas(w, h, 8);
+      maps.appendChild(cv); cvs.push(cv);
+    }
+    div.appendChild(maps); el.appendChild(div); views.push(cvs);
+  });
+}
+
+// ---------- input: draw, examples, shift ----------
+let x = new Float32Array(784), model = 0;
+const EXAMPLES = decode(DATA.examples, Uint8Array);
+function setExample(d) { x = Float32Array.from(EXAMPLES.subarray(784 * d, 784 * d + 784), v => v / 255); update(); }
+function shift(dx, dy) {
+  const y = new Float32Array(784);
+  for (let i = 0; i < 28; i++) for (let j = 0; j < 28; j++) { const r = i - dy, c = j - dx; if (r >= 0 && r < 28 && c >= 0 && c < 28) y[i * 28 + j] = x[r * 28 + c]; }
+  x = y;
+}
+function centre() {  // move the centre of mass to the image centre, as in MNIST preprocessing
+  let m = 0, mi = 0, mj = 0;
+  for (let i = 0; i < 28; i++) for (let j = 0; j < 28; j++) { const v = x[i * 28 + j]; m += v; mi += v * i; mj += v * j; }
+  if (m > 0) shift(Math.round(13.5 - mj / m), Math.round(13.5 - mi / m));
+}
+function stamp(u, v) {  // soft brush of about three pixels width, in 28 x 28 coordinates
+  for (let i = Math.floor(v - 2); i <= Math.ceil(v + 2); i++) for (let j = Math.floor(u - 2); j <= Math.ceil(u + 2); j++) {
+    if (i < 0 || i >= 28 || j < 0 || j >= 28) continue;
+    const d2 = (i + 0.5 - v) ** 2 + (j + 0.5 - u) ** 2;
+    x[i * 28 + j] = Math.max(x[i * 28 + j], Math.min(1, 1.6 * Math.exp(-d2 / 1.4)));
+  }
+}
+function setupDrawing() {
+  const pad = $("pad"); let last = null;
+  const pos = e => { const r = pad.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * 28, (e.clientY - r.top) / r.height * 28]; };
+  pad.addEventListener("pointerdown", e => { pad.setPointerCapture(e.pointerId); last = pos(e); stamp(...last); update(); });
+  pad.addEventListener("pointermove", e => {
+    if (!last) return;
+    const p = pos(e), steps = Math.ceil(Math.hypot(p[0] - last[0], p[1] - last[1]) * 4);
+    for (let t = 1; t <= steps; t++) stamp(last[0] + (p[0] - last[0]) * t / steps, last[1] + (p[1] - last[1]) * t / steps);
+    last = p; update();
+  });
+  for (const type of ["pointerup", "pointercancel"]) pad.addEventListener(type, () => { if (last) { last = null; centre(); update(); } });
+}
+
+// ---------- update ----------
+function setModel(m) {
+  model = Math.max(0, Math.min(DATA.models.length - 1, m));
+  const M = DATA.models[model];
+  net = parse(M.spec, decode(M.weights, Float32Array));
+  build(); setupDrawing();
+  for (const b of $("models").querySelectorAll("button")) b.classList.toggle("on", Number(b.dataset.m) === model);
+  $("info").innerHTML = `${M.name}: ${M.params.toLocaleString("en")} parameters, trained ${M.epochs} epochs on MNIST with random shifts, test accuracy ${(100 * M.test_acc).toFixed(1)}%. First-layer filters beside their maps.`;
+  update();
+}
+function update() {
+  grayInto($("pad"), x, 0, 28, 28, 1);
+  const acts = forward(x);
+  net.forEach((L, l) => {
+    if (L.last) return;
+    const a = acts[l], hi = Math.max(...a);
+    if (views[l].length > 1 || L.t === "conv" || L.t === "pool") views[l].forEach((cv, c) => grayInto(cv, a, c * L.n * L.n, L.n, L.n, hi));
+    else { const [h, w] = unitGrid(L.len), padded = new Float32Array(h * w); padded.set(a); grayInto(views[l][0], padded, 0, w, h, hi); }
+  });
+  const prob = acts[acts.length - 1], top = prob.indexOf(Math.max(...prob));
+  prob.forEach((p, d) => {
+    $(`b${d}`).style.width = `${(100 * p).toFixed(1)}%`;
+    $(`p${d}`).textContent = `${(100 * p).toFixed(0)}%`;
+    for (const id of [`d${d}`, `p${d}`]) $(id).classList.toggle("top", d === top);
+  });
+}
+
+$("models").innerHTML = DATA.models.map((M, m) => `<button data-m="${m}">${M.name}</button>`).join("");
+$("models").addEventListener("click", e => { if (e.target.dataset.m) setModel(Number(e.target.dataset.m)); });
+$("examples").innerHTML = Array.from({ length: 10 }, (_, d) => `<button data-d="${d}">${d}</button>`).join("");
+$("examples").addEventListener("click", e => { if (e.target.dataset.d) setExample(Number(e.target.dataset.d)); });
+$("clear").addEventListener("click", () => { x = new Float32Array(784); update(); });
+$("center").addEventListener("click", () => { centre(); update(); });
+document.addEventListener("keydown", e => {
+  const d = { ArrowRight: [1, 0], ArrowLeft: [-1, 0], ArrowDown: [0, 1], ArrowUp: [0, -1] }[e.key];
+  if (d) { e.preventDefault(); shift(...d); update(); }
+});
+const hash = hashState({ model: 0, digit: 3 }, h => { h.digit = Math.max(0, Math.min(9, Math.round(h.digit) || 0)); h.model = Math.round(h.model) || 0; }).read();
+x = Float32Array.from(EXAMPLES.subarray(784 * hash.digit, 784 * hash.digit + 784), v => v / 255);
+setModel(hash.model);
+</script>
+</body>
+</html>

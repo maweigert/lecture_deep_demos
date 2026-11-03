@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deep learning demos</title>
+<link rel="stylesheet" href="common/demo.css">
+<style>
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; gap: 14px; }
+  h1 { font-size: 1.5rem; }
+  p.sub { margin: 0 0 8px; color: var(--muted); }
+  .card { background: var(--panel); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { font-size: 1.1rem; margin: 0 0 4px; }
+  .card h2 small { font-weight: 400; color: var(--muted); font-size: 0.85rem; margin-left: 8px; }
+  .card p { margin: 0 0 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips a { font-size: 12px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); text-decoration: none; }
+  .chips a:hover { border-color: var(--accent); }
+  .chips a.open { background: var(--accent); color: white; border-color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>Deep learning demos</h1>
+    <p class="sub">Interactive companions to the lecture <i>Deep Learning for Vision</i>. Every setting is kept in the URL, so links below open a demo in the state shown on the slides.</p>
+  </div>
+  <section id="list"></section>
+</main>
+<script type="module">
+const { demos } = await (await fetch("presets.json")).json();
+document.getElementById("list").innerHTML = demos.map(d => `<div class="card">
+  <h2><a href="${d.id}/">${d.title}</a><small>lecture ${d.lecture}</small></h2>
+  <p>${d.summary}</p>
+  <div class="chips"><a class="open" href="${d.id}/">open</a>${d.presets.map(p => `<a href="${d.id}/#${p.hash}">${p.label}</a>`).join("")}</div>
+</div>`).join("");
+</script>
+</body>
+</html>
